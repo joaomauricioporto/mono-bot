@@ -4,7 +4,7 @@ import anthropic
 import json
 import os
 from datetime import datetime
-import sqlite3
+import httpx
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -12,104 +12,99 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "sua-chave-aqui")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
+HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=representation"
+}
+
 # ============================================================
-# BANCO DE DADOS
+# BANCO DE DADOS — Supabase
 # ============================================================
-DB_PATH = "/tmp/gastos.db"
-
-def get_conn():
-    return sqlite3.connect(DB_PATH)
-
-def init_db():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS gastos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            data TEXT,
-            descricao TEXT,
-            valor REAL,
-            categoria TEXT,
-            forma_pagamento TEXT,
-            telefone TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-    logger.info("Banco de dados inicializado.")
-
 def salvar_gasto(descricao, valor, categoria, forma_pagamento, telefone):
-    try:
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO gastos (data, descricao, valor, categoria, forma_pagamento, telefone)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (datetime.now().strftime("%Y-%m-%d %H:%M"), descricao, valor, categoria, forma_pagamento, telefone))
-        conn.commit()
-        inserted_id = c.lastrowid
-        conn.close()
-        logger.info(f"Gasto salvo: id={inserted_id} descricao={descricao} valor={valor}")
-        return inserted_id
-    except Exception as e:
-        logger.error(f"Erro ao salvar gasto: {e}")
-        raise
+    data = {
+        "data": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "descricao": descricao,
+        "valor": valor,
+        "categoria": categoria,
+        "forma_pagamento": forma_pagamento,
+        "telefone": telefone
+    }
+    r = httpx.post(f"{SUPABASE_URL}/rest/v1/gastos", headers=HEADERS, json=data)
+    r.raise_for_status()
+    resultado = r.json()
+    gasto_id = resultado[0]["id"] if resultado else "?"
+    logger.info(f"Gasto salvo: id={gasto_id} descricao={descricao} valor={valor}")
+    return gasto_id
 
 def buscar_gastos(telefone, periodo="mes"):
-    conn = get_conn()
-    c = conn.cursor()
     hoje = datetime.now()
-
     if periodo == "hoje":
         filtro = hoje.strftime("%Y-%m-%d")
-        c.execute("SELECT * FROM gastos WHERE telefone=? AND data LIKE ?", (telefone, f"{filtro}%"))
+        params = {"telefone": f"eq.{telefone}", "data": f"like.{filtro}%", "order": "id.desc"}
     elif periodo == "semana":
         from datetime import timedelta
         inicio = (hoje - timedelta(days=7)).strftime("%Y-%m-%d")
-        c.execute("SELECT * FROM gastos WHERE telefone=? AND data >= ?", (telefone, inicio))
+        params = {"telefone": f"eq.{telefone}", "data": f"gte.{inicio}", "order": "id.desc"}
     else:
         filtro = hoje.strftime("%Y-%m")
-        c.execute("SELECT * FROM gastos WHERE telefone=? AND data LIKE ?", (telefone, f"{filtro}%"))
+        params = {"telefone": f"eq.{telefone}", "data": f"like.{filtro}%", "order": "id.desc"}
 
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    r = httpx.get(f"{SUPABASE_URL}/rest/v1/gastos", headers=HEADERS, params=params)
+    r.raise_for_status()
+    return r.json()
 
 def remover_ultimo_gasto(telefone):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM gastos WHERE telefone=? ORDER BY id DESC LIMIT 1", (telefone,))
-    gasto = c.fetchone()
-    if gasto:
-        c.execute("DELETE FROM gastos WHERE id=?", (gasto[0],))
-        conn.commit()
-    conn.close()
+    r = httpx.get(
+        f"{SUPABASE_URL}/rest/v1/gastos",
+        headers=HEADERS,
+        params={"telefone": f"eq.{telefone}", "order": "id.desc", "limit": "1"}
+    )
+    r.raise_for_status()
+    gastos = r.json()
+    if not gastos:
+        return None
+    gasto = gastos[0]
+    httpx.delete(
+        f"{SUPABASE_URL}/rest/v1/gastos",
+        headers=HEADERS,
+        params={"id": f"eq.{gasto['id']}"}
+    )
     return gasto
 
 def remover_gasto_por_descricao(telefone, descricao):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        SELECT * FROM gastos WHERE telefone=? AND descricao LIKE ?
-        ORDER BY id DESC LIMIT 1
-    """, (telefone, f"%{descricao}%"))
-    gasto = c.fetchone()
-    if gasto:
-        c.execute("DELETE FROM gastos WHERE id=?", (gasto[0],))
-        conn.commit()
-    conn.close()
+    r = httpx.get(
+        f"{SUPABASE_URL}/rest/v1/gastos",
+        headers=HEADERS,
+        params={"telefone": f"eq.{telefone}", "descricao": f"ilike.%{descricao}%", "order": "id.desc", "limit": "1"}
+    )
+    r.raise_for_status()
+    gastos = r.json()
+    if not gastos:
+        return None
+    gasto = gastos[0]
+    httpx.delete(
+        f"{SUPABASE_URL}/rest/v1/gastos",
+        headers=HEADERS,
+        params={"id": f"eq.{gasto['id']}"}
+    )
     return gasto
 
 def listar_ultimos_gastos(telefone, limite=5):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM gastos WHERE telefone=? ORDER BY id DESC LIMIT ?", (telefone, limite))
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    r = httpx.get(
+        f"{SUPABASE_URL}/rest/v1/gastos",
+        headers=HEADERS,
+        params={"telefone": f"eq.{telefone}", "order": "id.desc", "limit": str(limite)}
+    )
+    r.raise_for_status()
+    return r.json()
 
 # ============================================================
 # IA
@@ -160,10 +155,10 @@ def gerar_relatorio(telefone, periodo):
         nomes = {"hoje": "hoje", "semana": "nos últimos 7 dias", "mes": "este mês"}
         return f"📭 Nenhum gasto registrado {nomes.get(periodo, 'neste período')}."
 
-    total = sum(g[3] for g in gastos)
+    total = sum(g["valor"] for g in gastos)
     por_categoria = {}
     for g in gastos:
-        por_categoria[g[4]] = por_categoria.get(g[4], 0) + g[3]
+        por_categoria[g["categoria"]] = por_categoria.get(g["categoria"], 0) + g["valor"]
 
     nomes_periodo = {"hoje": "Hoje", "semana": "Últimos 7 dias", "mes": "Este mês"}
     linhas = [f"📊 *Relatório — {nomes_periodo.get(periodo, 'Período')}*\n"]
@@ -178,7 +173,7 @@ def gerar_historico(telefone):
         return "📭 Nenhum gasto registrado ainda."
     linhas = ["🧾 *Últimos gastos:*\n"]
     for g in gastos:
-        linhas.append(f"• {g[2].capitalize()} — R$ {g[3]:.2f} ({g[4]})")
+        linhas.append(f"• {g['descricao'].capitalize()} — R$ {g['valor']:.2f} ({g['categoria']})")
     return "\n".join(linhas)
 
 # ============================================================
@@ -243,14 +238,14 @@ async def webhook(
         elif resultado["tipo"] == "remover_ultimo":
             gasto = remover_ultimo_gasto(telefone)
             if gasto:
-                resposta = f"🗑️ *Gasto removido!*\n\n📌 {gasto[2].capitalize()} — R$ {gasto[3]:.2f}"
+                resposta = f"🗑️ *Gasto removido!*\n\n📌 {gasto['descricao'].capitalize()} — R$ {gasto['valor']:.2f}"
             else:
                 resposta = "📭 Nenhum gasto encontrado para remover."
 
         elif resultado["tipo"] == "remover_item":
             gasto = remover_gasto_por_descricao(telefone, resultado.get("descricao", ""))
             if gasto:
-                resposta = f"🗑️ *Gasto removido!*\n\n📌 {gasto[2].capitalize()} — R$ {gasto[3]:.2f}"
+                resposta = f"🗑️ *Gasto removido!*\n\n📌 {gasto['descricao'].capitalize()} — R$ {gasto['valor']:.2f}"
             else:
                 resposta = "❌ Não encontrei nenhum gasto com esse nome."
 
@@ -273,5 +268,3 @@ async def webhook(
 @app.get("/")
 def health():
     return {"status": "Mono bot rodando! 🐒"}
-
-init_db()
