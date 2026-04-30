@@ -5,23 +5,26 @@ import json
 import os
 from datetime import datetime
 import sqlite3
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# ============================================================
-# CONFIGURAÇÕES — preencha com suas chaves
-# ============================================================
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "sua-chave-aqui")
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
-
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ============================================================
 # BANCO DE DADOS
 # ============================================================
+DB_PATH = "/tmp/gastos.db"
+
+def get_conn():
+    return sqlite3.connect(DB_PATH)
+
 def init_db():
-    conn = sqlite3.connect("gastos.db")
+    conn = get_conn()
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS gastos (
@@ -36,19 +39,27 @@ def init_db():
     """)
     conn.commit()
     conn.close()
+    logger.info("Banco de dados inicializado.")
 
 def salvar_gasto(descricao, valor, categoria, forma_pagamento, telefone):
-    conn = sqlite3.connect("gastos.db")
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO gastos (data, descricao, valor, categoria, forma_pagamento, telefone)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (datetime.now().strftime("%Y-%m-%d %H:%M"), descricao, valor, categoria, forma_pagamento, telefone))
-    conn.commit()
-    conn.close()
+    try:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO gastos (data, descricao, valor, categoria, forma_pagamento, telefone)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (datetime.now().strftime("%Y-%m-%d %H:%M"), descricao, valor, categoria, forma_pagamento, telefone))
+        conn.commit()
+        inserted_id = c.lastrowid
+        conn.close()
+        logger.info(f"Gasto salvo: id={inserted_id} descricao={descricao} valor={valor}")
+        return inserted_id
+    except Exception as e:
+        logger.error(f"Erro ao salvar gasto: {e}")
+        raise
 
 def buscar_gastos(telefone, periodo="mes"):
-    conn = sqlite3.connect("gastos.db")
+    conn = get_conn()
     c = conn.cursor()
     hoje = datetime.now()
 
@@ -59,7 +70,7 @@ def buscar_gastos(telefone, periodo="mes"):
         from datetime import timedelta
         inicio = (hoje - timedelta(days=7)).strftime("%Y-%m-%d")
         c.execute("SELECT * FROM gastos WHERE telefone=? AND data >= ?", (telefone, inicio))
-    else:  # mes
+    else:
         filtro = hoje.strftime("%Y-%m")
         c.execute("SELECT * FROM gastos WHERE telefone=? AND data LIKE ?", (telefone, f"{filtro}%"))
 
@@ -67,39 +78,64 @@ def buscar_gastos(telefone, periodo="mes"):
     conn.close()
     return rows
 
+def remover_ultimo_gasto(telefone):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM gastos WHERE telefone=? ORDER BY id DESC LIMIT 1", (telefone,))
+    gasto = c.fetchone()
+    if gasto:
+        c.execute("DELETE FROM gastos WHERE id=?", (gasto[0],))
+        conn.commit()
+    conn.close()
+    return gasto
+
+def remover_gasto_por_descricao(telefone, descricao):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT * FROM gastos WHERE telefone=? AND descricao LIKE ?
+        ORDER BY id DESC LIMIT 1
+    """, (telefone, f"%{descricao}%"))
+    gasto = c.fetchone()
+    if gasto:
+        c.execute("DELETE FROM gastos WHERE id=?", (gasto[0],))
+        conn.commit()
+    conn.close()
+    return gasto
+
+def listar_ultimos_gastos(telefone, limite=5):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM gastos WHERE telefone=? ORDER BY id DESC LIMIT ?", (telefone, limite))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
 # ============================================================
-# IA — INTERPRETAÇÃO DA MENSAGEM
+# IA
 # ============================================================
 SYSTEM_PROMPT = """Você é um assistente financeiro pessoal via WhatsApp chamado Mono 🐒.
-Seu trabalho é interpretar mensagens e extrair informações de gastos OU gerar relatórios.
+Responda APENAS com JSON válido, sem markdown, sem explicações.
 
-Quando o usuário mandar uma mensagem de gasto (ex: "uber 27", "mercado 150 débito", "almoço 35 pix"):
-Responda APENAS com JSON válido no formato:
-{
-  "tipo": "gasto",
-  "descricao": "descrição do gasto",
-  "valor": 27.0,
-  "categoria": "Transporte",
-  "forma_pagamento": "não informado"
-}
+1. REGISTRAR GASTO (ex: "uber 27", "mercado 150 débito", "almoço 35 pix"):
+{"tipo": "gasto", "descricao": "descrição", "valor": 27.0, "categoria": "Transporte", "forma_pagamento": "não informado"}
+Categorias: Alimentação, Transporte, Lazer, Saúde, Moradia, Educação, Vestuário, Outros
 
-Categorias possíveis: Alimentação, Transporte, Lazer, Saúde, Moradia, Educação, Vestuário, Outros
+2. RELATÓRIO (ex: "resumo", "quanto gastei hoje", "resumo da semana"):
+{"tipo": "relatorio", "periodo": "mes"}
+Períodos: hoje, semana, mes
 
-Quando o usuário pedir relatório (ex: "resumo", "relatório", "quanto gastei", "resumo do mês"):
-Responda APENAS com JSON:
-{
-  "tipo": "relatorio",
-  "periodo": "mes"
-}
-Períodos possíveis: hoje, semana, mes
+3. REMOVER ÚLTIMO (ex: "remover último", "apagar último", "desfazer"):
+{"tipo": "remover_ultimo"}
 
-Quando a mensagem não for gasto nem relatório (ex: "oi", "ajuda", "comandos"):
-Responda APENAS com JSON:
-{
-  "tipo": "ajuda"
-}
+4. REMOVER ESPECÍFICO (ex: "remover uber", "apagar mercado"):
+{"tipo": "remover_item", "descricao": "uber"}
 
-IMPORTANTE: Responda SOMENTE o JSON, sem texto adicional, sem markdown."""
+5. HISTÓRICO (ex: "últimos gastos", "o que registrei"):
+{"tipo": "historico"}
+
+6. OUTROS (ex: "oi", "ajuda"):
+{"tipo": "ajuda"}"""
 
 def interpretar_mensagem(mensagem):
     response = client.messages.create(
@@ -109,14 +145,17 @@ def interpretar_mensagem(mensagem):
         messages=[{"role": "user", "content": mensagem}]
     )
     texto = response.content[0].text.strip()
-    return json.loads(texto)
+    if texto.startswith("```"):
+        texto = texto.split("```")[1]
+        if texto.startswith("json"):
+            texto = texto[4:]
+    return json.loads(texto.strip())
 
 # ============================================================
-# GERAÇÃO DE RELATÓRIO
+# RELATÓRIO
 # ============================================================
 def gerar_relatorio(telefone, periodo):
     gastos = buscar_gastos(telefone, periodo)
-
     if not gastos:
         nomes = {"hoje": "hoje", "semana": "nos últimos 7 dias", "mes": "este mês"}
         return f"📭 Nenhum gasto registrado {nomes.get(periodo, 'neste período')}."
@@ -124,25 +163,28 @@ def gerar_relatorio(telefone, periodo):
     total = sum(g[3] for g in gastos)
     por_categoria = {}
     for g in gastos:
-        cat = g[4]
-        por_categoria[cat] = por_categoria.get(cat, 0) + g[3]
+        por_categoria[g[4]] = por_categoria.get(g[4], 0) + g[3]
 
     nomes_periodo = {"hoje": "Hoje", "semana": "Últimos 7 dias", "mes": "Este mês"}
-    titulo = nomes_periodo.get(periodo, "Período")
-
-    linhas = [f"📊 *Relatório — {titulo}*\n"]
+    linhas = [f"📊 *Relatório — {nomes_periodo.get(periodo, 'Período')}*\n"]
     for cat, val in sorted(por_categoria.items(), key=lambda x: -x[1]):
         linhas.append(f"  {cat}: R$ {val:.2f}")
     linhas.append(f"\n💰 *Total: R$ {total:.2f}*")
+    return "\n".join(linhas)
 
+def gerar_historico(telefone):
+    gastos = listar_ultimos_gastos(telefone)
+    if not gastos:
+        return "📭 Nenhum gasto registrado ainda."
+    linhas = ["🧾 *Últimos gastos:*\n"]
+    for g in gastos:
+        linhas.append(f"• {g[2].capitalize()} — R$ {g[3]:.2f} ({g[4]})")
     return "\n".join(linhas)
 
 # ============================================================
-# MENSAGEM DE AJUDA
+# AJUDA
 # ============================================================
 MENSAGEM_AJUDA = """🐒 *Olá! Sou o Mono, seu assistente financeiro!*
-
-Veja o que posso fazer:
 
 *📝 Registrar gastos:*
 • "mercado 150"
@@ -150,14 +192,21 @@ Veja o que posso fazer:
 • "almoço 35 cartão"
 
 *📊 Ver relatórios:*
-• "resumo" ou "relatório"
+• "resumo" ou "resumo da semana"
 • "quanto gastei hoje"
-• "resumo da semana"
 
-*💡 Dica:* Pode escrever de forma natural, eu entendo! 😊"""
+*🧾 Ver histórico:*
+• "últimos gastos"
+
+*🗑️ Remover gastos:*
+• "remover último"
+• "remover uber"
+• "apagar mercado"
+
+*💡 Escreva de forma natural, eu entendo! 😊*"""
 
 # ============================================================
-# WEBHOOK — recebe mensagens do WhatsApp via Twilio
+# WEBHOOK
 # ============================================================
 @app.post("/webhook", response_class=PlainTextResponse)
 async def webhook(
@@ -166,12 +215,14 @@ async def webhook(
 ):
     mensagem = Body.strip()
     telefone = From
+    logger.info(f"Mensagem recebida de {telefone}: {mensagem}")
 
     try:
         resultado = interpretar_mensagem(mensagem)
+        logger.info(f"Interpretado: {resultado}")
 
         if resultado["tipo"] == "gasto":
-            salvar_gasto(
+            gasto_id = salvar_gasto(
                 descricao=resultado["descricao"],
                 valor=resultado["valor"],
                 categoria=resultado["categoria"],
@@ -179,7 +230,7 @@ async def webhook(
                 telefone=telefone
             )
             resposta = (
-                f"✅ *Gasto registrado!*\n\n"
+                f"✅ *Gasto registrado!* (#{gasto_id})\n\n"
                 f"📌 {resultado['descricao'].capitalize()}\n"
                 f"💵 R$ {resultado['valor']:.2f}\n"
                 f"🏷️ {resultado['categoria']}\n"
@@ -189,13 +240,30 @@ async def webhook(
         elif resultado["tipo"] == "relatorio":
             resposta = gerar_relatorio(telefone, resultado.get("periodo", "mes"))
 
+        elif resultado["tipo"] == "remover_ultimo":
+            gasto = remover_ultimo_gasto(telefone)
+            if gasto:
+                resposta = f"🗑️ *Gasto removido!*\n\n📌 {gasto[2].capitalize()} — R$ {gasto[3]:.2f}"
+            else:
+                resposta = "📭 Nenhum gasto encontrado para remover."
+
+        elif resultado["tipo"] == "remover_item":
+            gasto = remover_gasto_por_descricao(telefone, resultado.get("descricao", ""))
+            if gasto:
+                resposta = f"🗑️ *Gasto removido!*\n\n📌 {gasto[2].capitalize()} — R$ {gasto[3]:.2f}"
+            else:
+                resposta = "❌ Não encontrei nenhum gasto com esse nome."
+
+        elif resultado["tipo"] == "historico":
+            resposta = gerar_historico(telefone)
+
         else:
             resposta = MENSAGEM_AJUDA
 
     except Exception as e:
-        resposta = f"⚠️ Não entendi sua mensagem. Tente algo como:\n• 'mercado 50'\n• 'resumo do mês'"
+        logger.error(f"Erro ao processar mensagem: {e}")
+        resposta = "⚠️ Não entendi sua mensagem. Tente:\n• 'mercado 50'\n• 'resumo'\n• 'remover último'"
 
-    # Formata resposta para o Twilio (TwiML)
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Message>{resposta}</Message>
@@ -206,7 +274,4 @@ async def webhook(
 def health():
     return {"status": "Mono bot rodando! 🐒"}
 
-# ============================================================
-# INICIALIZAÇÃO
-# ============================================================
 init_db()
